@@ -1,83 +1,73 @@
 # GStroy Internal Print Server
 
-## Overview
-This service acts as an internal print hub for Zebra-compatible printers (Bixolon XD5-40d) by exposing a lightweight Flask REST API. It validates incoming requests, sanitizes label data, and forwards generated ZPL directly to TCP port 9100.
+### Purpose
+Modular Flask service that exposes Zebra-compatible label printing and printer health endpoints. The runtime sanitizes inputs, generates ZPL, and streams it directly to TCP port `9100` without intermediate files.
 
-## Architecture & Behavior
-- **Flask API** exposes three endpoints: health, printer status, and two printing actions.
-- **Direct Zebra Connection**: Every interaction happens over a persistent TCP socket to `:9100` without intermediate storage.
-- **Runtime Limits**: Copies, text length, and timeouts are hard limits (`MAX_COPIES`, `MAX_TEXT_LEN`, connection/write timeouts) to avoid overloading the printer or the network.
-- **Minimal Dependencies**: Only Flask and Python standard library modules are required, ensuring fast startup and easy deployment.
+### Project layout
+- `app.py`: executable entry point (`create_app` factory is invoked, sets up logging/printouts).
+- `gstroy_server/config.py`: centralized configuration values (ports, timeouts, label dimensions).
+- `gstroy_server/middleware.py`: reusable CORS hook so every response is browser-friendly.
+- `gstroy_server/blueprints/`: Flask blueprints that keep routing separate from services.
+  - `core.py`: health metadata endpoint.
+  - `printers.py`: printer status plus the two label-printing actions.
+- `gstroy_server/services/`: reusable helpers.
+  - `label.py`: ZPL builders for product and list labels.
+  - `printer.py`: raw TCP/timeout handling.
+  - `text_utils.py` + `validators.py`: shared sanitizers and IP checks.
 
-## Requirements
-- Python 3.11+ (confirm compatibility if upgrading)
-- Dependencies tracked via `requirements.txt` (`Flask>=2.3,<3`)
-- Network connectivity to Zebra/Bixolon printers (XD5-40d tested) on TCP port 9100
-
-## Local Setup
-1. Create and activate a virtual environment (recommended):
+### Requirements & install
+1. Create/activate a virtualenv:
    ```powershell
    python -m venv .venv
    .venv\Scripts\Activate.ps1
    ```
-2. Install dependencies from requirements:
+2. Install dependencies:
    ```powershell
    pip install -r requirements.txt
    ```
-3. Set runtime port (default `8001`):
+
+### Run locally
+1. Optionally set `LABEL_SERVER_PORT` (defaults to `8001`):
    ```powershell
    $env:LABEL_SERVER_PORT = "8001"
    ```
-4. Start the server:
+2. Start the server:
    ```powershell
-   python printer-server.py
+   python app.py
    ```
 
-## Configuration
-- `LABEL_SERVER_PORT` (default `8001`): HTTP port for the Flask app.
-- Zebra printers are targeted on port `9100`; that socket is hardcoded.
-- Static timeouts are defined via `PING_TIMEOUT`, `PRINT_CONNECT_TIMEOUT`, and `PRINT_WRITE_TIMEOUT`; adjust by editing the module if needed.
+### API reference
+All endpoints live under `/` or `/printers`. Responses are JSON with `Content-Type: application/json`.
 
-## API Reference
-All endpoints respond with JSON (`Content-Type: application/json`).
+#### `GET /`
+Returns metadata for health checks.
 
-### `GET /`
-- Returns basic service metadata.
-  ```json
-  {
-    "service": "GStroy Internal Print Server",
-    "status": "running",
-    "version": "2.0-final"
-  }
-  ```
-
-### `GET /printers/<ip>/status`
-- Parameters: `<ip>` – IPv4 address of the Zebra printer.
-- Attempts a TCP connection to port `9100` and reports whether the device is reachable.
+#### `GET /printers/<ip>/status`
+- Checks TCP `9100` reachability for the requested IPv4 printer.
+- Success response (HTTP 200):
   ```json
   { "ip": "192.168.1.100", "online": true, "checked_at": "15:23:10" }
   ```
-- Invalid IP values return `400` with an explanatory message.
+- Invalid IP yields HTTP 400 with `error`.
 
-### `POST /printers/<ip>/print-product-label`
-- Payload example:
+#### `POST /printers/<ip>/print-product-label`
+- JSON payload:
   ```json
   {
     "name": "Widget Model X",
     "barcode": "123456789012",
     "quantity": 12,
-    "copies": 3
+    "copies": 2
   }
   ```
-- Behavior: sanitizes text, splits the product name into two lines, renders a Code128 barcode, adds a human-readable quantity, and subject to the `MAX_COPIES` limit.
-- Success response:
+- Generates the product label ZPL and pushes it to the printer.
+- Response:
   ```json
-  { "success": true, "message": "Sent to printer" }
+  { "success": true, "message": "Pro Product Label Sent" }
   ```
-- Errors bubble up as `500` with `error`.
 
-### `POST /printers/<ip>/print-list-label`
-- Payload example:
+#### `POST /printers/<ip>/print-list-label`
+- JSON payload:
   ```json
   {
     "name": "Picking List 1056",
@@ -85,32 +75,21 @@ All endpoints respond with JSON (`Content-Type: application/json`).
     "copies": 1
   }
   ```
-- Behavior: formats the provided title, generates a QR code via `^BQN`, and prints the label. Copies obey the same `1..MAX_COPIES` clamp.
-- Success/error semantics match `print-product-label`.
+- Streams a list label containing a QR block.
+- Same success/error schema above.
 
-## Label Generation Details
-- `generate_product_label` limits the name to two lines (22 characters each) and prints a Code128 barcode plus quantity text.
-- `generate_list_label` prints a header and a QR code, followed by a compact textual identifier (first 15 characters of `qr_data`).
-- `clean_text` strips `^`, `~`, and newline characters before truncating to `MAX_TEXT_LEN` (50 characters).
-- Quantity formatting leverages `clean_qty`, which emits integer values when possible or two-decimal floats.
+### Label/service internals
+- `generate_pro_product_label` clamps copies, sanitizes text, renders a Code128 barcode, prints a timestamp and quantity line, and frames the layout at configured width/height.
+- `generate_list_label` includes a header plus structured QR data trimmed to 15 characters for the human-friendly footer. Empty segments are skipped before joining.
+- `check_printer_online` and `send_zpl_to_socket` reuse the config-driven timeouts and raise clear errors when the socket operations fail.
 
-## Error Handling & Troubleshooting
-- **Timeout from Zebra**: ensure the printer is online and accessible over TCP 9100, and increase `PRINT_CONNECT_TIMEOUT`/`PRINT_WRITE_TIMEOUT` if the network is slow.
-- **`ValueError` for IP**: the API returns HTTP `400`; verify that the client submits a valid IPv4 literal.
-- **`OSError` on send**: the printer may reject the connection or the socket is closed mid-session; inspect Zebra logs and network appliances.
-- **Monitoring**: capture `stdout`/`stderr` from Flask when running under a service supervisor to track request flow and failures.
+### Observability & security
+- Logs rotate under `logs/gstroy-server.log` with 5 MB chunks and five backups (use `GSTROY_LOG_DIR`, `GSTROY_LOG_FILE`, `GSTROY_LOG_MAX_BYTES`, `GSTROY_LOG_BACKUP_COUNT` to override). Every request, print job, and exception is recorded at INFO/ERROR so you have an audit trail for deployments.
+- `gstroy_server.middleware.register_cors` now also records every incoming HTTP request and its response duration to the console/log file so you can watch activity live and later audit the logs.
+- CORS headers are already managed by `gstroy_server.middleware.register_cors`, and every POST endpoint enforces JSON payloads before moving on to label generation.
+- Harden deployments by running the Flask app behind TLS/ACL-enforced frontends (reverse proxy or VPN), pinning network access to your printer VLAN, and keeping `debug=False`.
 
-## Deployment & Maintenance Notes
-- Run under a process manager (`gunicorn`, `waitress`, or `systemd`) and expose `LABEL_SERVER_PORT` as needed.
-- Consider adding structured logging with rotation for production observability.
-- A Dockerfile can wrap the app, exposing port `8001` and passing `LABEL_SERVER_PORT` through environment variables.
-
-## Security Considerations
-- Keep `debug=False`; never deploy Flask’s debugger in production.
-- Restrict network access via ACLs or place the service behind a reverse proxy like `nginx`.
-- The current sanitization is simple; introduce stricter validation (whitelist of allowed characters) if untrusted clients are expected.
-
-## Suggested Next Steps
-1. Add mocked socket integration tests to ensure ZPL generation remains stable.
-2. Expand the `docs/` directory with printer settings, QR specifications, and architecture diagrams.
-3. Introduce OpenAPI/Swagger documentation to simplify onboarding for API consumers.
+### Next steps
+1. Containerize (`Dockerfile`) and map `LABEL_SERVER_PORT` as needed.
+2. Add automated tests around label generation (pure string outputs) and mocked socket behavior.
+3. Consider exposing OpenAPI docs or Postman collections so clients know the request schema in advance.
