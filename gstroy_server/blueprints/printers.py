@@ -3,7 +3,7 @@ from datetime import datetime
 
 from flask import Blueprint, jsonify, request
 
-from ..services.label import generate_list_label, generate_pro_product_label
+from ..services.label import build_unit_info, generate_list_label, generate_pro_product_label
 from ..services.printer import check_printer_online, send_zpl_to_socket
 
 logger = logging.getLogger("gstroy.printers")
@@ -36,11 +36,15 @@ def print_product_label(ip):
 
     data = request.get_json(silent=True) or {}
     try:
-        unit_text = data.get("unit_info") or str(data.get("quantity", ""))
+        unit_info = build_unit_info(
+            data.get("unit_info"),
+            data.get("quantity"),
+            data.get("quantities"),
+        )
         zpl = generate_pro_product_label(
             name=data.get("name", ""),
             barcode=data.get("barcode", ""),
-            unit_info=unit_text,
+            unit_info=unit_info,
             copies=data.get("copies", 1),
         )
         send_zpl_to_socket(ip, zpl)
